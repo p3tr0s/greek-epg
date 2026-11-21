@@ -1,0 +1,49 @@
+name: Update EPG
+
+on:
+  schedule:
+    - cron: "23 2 * * *"   # daily, ~04:23 Athens time
+  workflow_dispatch:        # "Run workflow" button for manual runs
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency: epg
+
+jobs:
+  grab:
+    runs-on: ubuntu-latest   # switch to "self-hosted" to scrape from a Greek IP
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Scrape
+        env:
+          # Optional repo secret, e.g. socks5h://user:pass@host:1080 (a Greek exit)
+          HTTPS_PROXY: ${{ secrets.EPG_PROXY }}
+        run: python3 greek_epg.py -o greece.xml --gz -d 5
+
+      - name: Publish to "epg" branch
+        run: |
+          mkdir out && mv greece.xml greece.xml.gz out/ && cd out
+          git init -q -b epg
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .
+          git commit -qm "EPG $(date -u +%F)"
+          git push -qf "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" epg
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Keep schedule alive (GitHub pauses idle cron after 60 days)
+        run: gh workflow enable epg.yml -R "${{ github.repository }}"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
