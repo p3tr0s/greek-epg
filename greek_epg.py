@@ -17,6 +17,7 @@ Channel ids look like "mega.gr" / "ert1.gr"; regional duplicates get a
 "-pz9" style suffix unless the channel is nationwide (those are deduped).
 """
 import argparse, gzip, re, sys, time, unicodedata
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
 from xml.sax.saxutils import escape
 from zoneinfo import ZoneInfo
@@ -61,6 +62,7 @@ GREEK = {ord(k): v for k, v in _M.items()}
 def slug(name):
     n = "".join(c for c in unicodedata.normalize("NFD", name.lower()) if not unicodedata.combining(c)).translate(GREEK)
     n = re.sub(r"[^a-z0-9]+", "", n)
+    n = re.sub(r"(?<=.)(fhd|uhd|hd)$", "", n)
     return n or "ch"
 
 
@@ -189,35 +191,33 @@ def scrape_cosmote(days):
         if cs and name:
             cid = f"{slug(name)}.gr"
             names[cs] = cid
-            logo = ((c.get("logos") or {}).get("square") or "") if isinstance(c.get("logos"), dict) else ""
+            logo = (c.get("logos") or {}).get("square") or "" if isinstance(c.get("logos"), dict) else ""
             chans.setdefault(cid, {"name": name, "logo": logo})
-    sigs = list(names)
     today = datetime.now(TZ).replace(hour=0, minute=0, second=0, microsecond=0)
-    for n in range(days):
-        d0 = today + timedelta(days=n)
+    jobs = [(cs, today + timedelta(days=n)) for n in range(days) for cs in names]
+
+    def one(job):
+        cs, d0 = job
         a, b = int(d0.timestamp()), int((d0 + timedelta(days=1)).timestamp()) - 1
-        for i in range(0, len(sigs), 15):
-            chunk = sigs[i:i + 15]
-            r = req("GET", f"{COSMOTE}/listings/el", headers=CH_HDR,
-                    params={"from": a, "to": b, "callSigns": ",".join(chunk),
-                            "endingIncludedInRange": "false"})
-            if not r:
-                continue
-            for ch in r.json().get("channels", []):
-                cid = names.get(ch.get("callSign")) or (names.get(chunk[0]) if len(chunk) == 1 else None)
-                if not cid:
+        r = req("GET", f"{COSMOTE}/listings/el", headers=CH_HDR,
+                params={"from": a, "to": b, "callSigns": cs, "endingIncludedInRange": "false"})
+        out = []
+        for ch in (r.json().get("channels", []) if r else []):
+            for it in ch.get("items", []):
+                if not it.get("startTime"):
                     continue
-                for it in ch.get("items", []):
-                    if not it.get("startTime"):
-                        continue
-                    progs.append({
-                        "ch": cid, "start": parse_dt(it["startTime"].replace("Z", "+00:00")),
-                        "stop": parse_dt(it["endTime"].replace("Z", "+00:00")) if it.get("endTime") else None,
-                        "title": (it.get("title") or "").strip() or "Χωρίς τίτλο",
-                        "desc": (it.get("description") or "").strip(),
-                        "cat": ((it.get("qoe") or {}).get("genre") or "").strip()})
-            time.sleep(0.3)
-        log(f"Cosmote day {d0.date()}: total {len(progs)} programmes")
+                out.append({
+                    "ch": names[cs], "start": parse_dt(it["startTime"].replace("Z", "+00:00")),
+                    "stop": parse_dt(it["endTime"].replace("Z", "+00:00")) if it.get("endTime") else None,
+                    "title": (it.get("title") or "").strip() or "Χωρίς τίτλο",
+                    "desc": (it.get("description") or "").strip(),
+                    "cat": ((it.get("qoe") or {}).get("genre") or "").strip()})
+        return out
+
+    with ThreadPoolExecutor(6) as ex:  # API takes one callSign per request
+        for out in ex.map(one, jobs):
+            progs += out
+    log(f"Cosmote: {len(progs)} programmes")
     return chans, progs
 
 
@@ -309,14 +309,17 @@ def main():
         c, p = scrape_digea(a.days, regions); chans.update(c); progs += p
     if not a.no_ert:
         c, p = scrape_ert(); chans.update(c); progs += p
+    def merge(c, p):  # add only channels no earlier source already covers
+        have = {x["ch"] for x in progs}
+        for k, v in c.items():
+            chans.setdefault(k, v)
+            if not chans[k].get("logo") and v.get("logo"):
+                chans[k]["logo"] = v["logo"]
+        progs.extend(x for x in p if x["ch"] not in have)
     if not a.no_cosmote:
-        c, p = scrape_cosmote(a.days)
-        for k, v in c.items(): chans.setdefault(k, v)
-        progs += p
+        merge(*scrape_cosmote(a.days))
     if not a.no_nova:
-        c, p = scrape_nova(min(a.days, 2))
-        for k, v in c.items(): chans.setdefault(k, v)
-        progs += p
+        merge(*scrape_nova(min(a.days, 2)))
     if not progs:
         log("No programmes scraped - aborting (keeping previous file)."); sys.exit(1)
 
